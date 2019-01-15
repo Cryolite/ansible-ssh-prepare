@@ -35,7 +35,7 @@ def _get_current_username() -> str:
 
 
 def _run_process(args: List[str], **kwargs) -> subprocess.CompletedProcess:
-    _print_debug(f"Executing the following command: `{args}'.")
+    _print_debug(f"Executing the following command: `{' '.join(args)}'.")
     if 'encoding' not in kwargs or kwargs['encoding'] is None:
         kwargs['encoding'] = 'UTF-8'
     if 'stdout' not in kwargs or kwargs['stdout'] is None:
@@ -635,7 +635,7 @@ returncode: {process.returncode}''')
     def run_process_with_password_based_ssh(
             self, args: List[str], **kwargs) -> subprocess.CompletedProcess:
         infix = ['ssh', '-o', 'StrictHostKeyChecking = yes',
-                 '-o', 'PreferredAuthentications = password']
+                 '-o', 'PreferredAuthentications = password', '-T']
         if self.port != 22:
             infix.extend(('-p', str(self.port)))
         if self.login_name != _get_current_username():
@@ -655,8 +655,8 @@ returncode: {process.returncode}''')
                 sudo_username=self.sudo_username)
 
         if self._login_password is None:
-            return self._run_process_impl_(infix, args,
-                                           login_user_process_runner, **kwargs)
+            return self._run_process_impl(infix, args,
+                                          login_user_process_runner, **kwargs)
 
         prefix = ['sshpass', '-e']
         prefix.extend(infix)
@@ -686,7 +686,7 @@ returncode: {process.returncode}''')
             self, args: List[str], **kwargs) -> subprocess.CompletedProcess:
         prefix = ['ssh', '-o', 'BatchMode = yes',
                   '-o', 'StrictHostKeyChecking = yes',
-                  '-o', 'PreferredAuthentications = publickey']
+                  '-o', 'PreferredAuthentications = publickey', '-T']
         if self.port != 22:
             prefix.extend(('-p', str(self.port)))
         if self.login_name != _get_current_username():
@@ -730,7 +730,7 @@ returncode: {process.returncode}''')
             self, target: 'UserOnServer') -> subprocess.CompletedProcess:
         args = ['ssh', '-o', 'BatchMode = yes',
                 '-o', 'StrictHostKeyChecking = yes',
-                '-o', 'PreferredAuthentications = publickey']
+                '-o', 'PreferredAuthentications = publickey', '-T']
         if target.port != 22:
             args.extend(('-p', str(target.port)))
         if self._sudo_username is None \
@@ -766,8 +766,8 @@ returncode: {process.returncode}''')
 
     def check_public_key_based_ssh_to_target(self,
                                              target: 'UserOnServer') -> bool:
-        process = self._check_public_key_based_ssh_to_target(target)
-        if process.returoncode != 0:
+        process = self._check_public_key_based_ssh_to_target_impl(target)
+        if process.returncode != 0:
             return False
         if target.sudo_username is None:
             expected_stdout = target.login_name
@@ -1157,9 +1157,12 @@ Ansible host variable `ansible_become_pass' of the host `{host}'.",
                 sudo_password = self._parse_indirect_password(
                     spec['sudo_password'], host)
 
-            user_on_server = UserOnServer(hostname, port, host_public_key,
-                                          login_name, login_password,
-                                          sudo_username, sudo_password)
+            user_on_server = UserOnServer(hostname=hostname, port=port,
+                                          host_public_key=host_public_key,
+                                          login_name=login_name,
+                                          login_password=login_password,
+                                          sudo_username=sudo_username,
+                                          sudo_password=sudo_password)
             user_on_server_set.add(user_on_server)
 
         return user_on_server_set
@@ -1295,10 +1298,12 @@ directories of `{process_runner.print_path(path)}'.")
 
 
 def _get_supported_keytypes(process_runner: ProcessRunner) -> Set[Keytype]:
-    process = process_runner.run(['ssh', '-Q', 'key'])
+    process = process_runner.run(['ssh', '-Q', 'key', '-T'])
     if process.returncode != 0 or process.stderr != '':
-        raise RuntimeError(f"`{process_runner}' failed to check supported \
-keytypes.")
+        # Workaround for old OpenSSHs
+        supported_keytypes = set()
+        supported_keytypes.add(Keytype('rsa'))
+        return supported_keytypes
 
     supported_keytypes = set()
     for line in process.stdout.rstrip('\n').splitlines():
@@ -1342,7 +1347,7 @@ def _get_user_known_hosts_file_path(process_runner: ProcessRunner,
                                     target_hostname: str) -> pathlib.Path:
     home_dir = _get_home_dir(process_runner)
 
-    process = process_runner.run(['ssh', '-G', target_hostname])
+    process = process_runner.run(['ssh', '-GT', target_hostname])
     if process.returncode != 0 or process.stderr != '':
         raise RuntimeError(f"`{process_runner}' failed to check the path to \
 the known hosts file.")
@@ -1415,7 +1420,7 @@ def _get_known_host_public_keys(process_runner: ProcessRunner,
 def _get_host_public_key_preference(
         process_runner: ProcessRunner,
         target_hostname: str) -> List[FineGrainedKeytype]:
-    process = process_runner.run(['ssh', '-G', target_hostname])
+    process = process_runner.run(['ssh', '-GT', target_hostname])
     if process.returncode != 0 or process.stderr != '':
         raise RuntimeError(f"`{process_runner}' failed to check preference \
 among host public keys.")
@@ -1507,7 +1512,7 @@ def _get_user_identities(process_runner: ProcessRunner,
                          target_hostname: str) -> Set[PublicKey]:
     home_dir = _get_home_dir(process_runner)
 
-    process = process_runner.run(['ssh', '-G', target_hostname])
+    process = process_runner.run(['ssh', '-GT', target_hostname])
     if process.returncode != 0 or process.stderr != '':
         raise RuntimeError("`{process_runner}' failed to get the path to \
 identity files.")
@@ -1559,6 +1564,8 @@ def _get_authorized_keys(process_runner: ProcessRunner) -> Set[PublicKey]:
 
     for path in (home_dir / '.ssh/authorized_keys',
                  home_dir / '.ssh/authorized_keys2'):
+        if not path.exists():
+            continue
         process = process_runner.run(['cat', str(path)])
         if process.returncode != 0:
             continue
@@ -1748,14 +1755,17 @@ if __name__ == '__main__':
         if isinstance(authorizee, UserOnServer):
             process_runner[authorizee] = None
         process_runner[target] = None
+    targets = []
     for target in process_runner.keys():
         _print_info(f"Checking which method the current user \
 `{_get_current_username()}' can log in to `{target}'... ", end='')
+
+        targets.append(target)
         if target.check_public_key_based_ssh():
             _print_info('public-key-based SSH.')
             process_runner[target] = ProcessRunner(
                 lambda args, **kwargs:
-                target.run_process_with_public_key_based_ssh(args, **kwargs),
+                targets[-1].run_process_with_public_key_based_ssh(args, **kwargs),
                 hostname=target.hostname, login_name=target.login_name,
                 sudo_username=target.sudo_username)
             continue
@@ -1764,7 +1774,7 @@ if __name__ == '__main__':
             _print_info('rsh')
             process_runner[target] = ProcessRunner(
                 lambda args, **kwargs:
-                target.run_process_with_rsh(args, **kwargs),
+                targets[-1].run_process_with_rsh(args, **kwargs),
                 hostname=target.hostname, login_name=target.login_name,
                 sudo_username=target.sudo_username)
             continue
@@ -1773,7 +1783,7 @@ if __name__ == '__main__':
             _print_info('password-based SSH.')
             process_runner[target] = ProcessRunner(
                 lambda args, **kwargs:
-                target.run_process_with_password_based_ssh(args, **kwargs),
+                targets[-1].run_process_with_password_based_ssh(args, **kwargs),
                 hostname=target.hostname, login_name=target.login_name,
                 sudo_username=target.sudo_username)
             continue
@@ -1806,7 +1816,7 @@ file by executing `ssh-keygen -R {target.hostname}' would resolve this issue.")
                 _print_info('public-key-based SSH.')
                 process_runner[target] = ProcessRunner(
                     lambda args, **kwargs:
-                    target.run_process_with_public_key_based_ssh(args, **kwargs),
+                    targets[-1].run_process_with_public_key_based_ssh(args, **kwargs),
                     hostname=target.hostname, login_name=target.login_name,
                     sudo_username=target.sudo_username)
                 continue
@@ -1815,7 +1825,7 @@ file by executing `ssh-keygen -R {target.hostname}' would resolve this issue.")
                 _print_info('password-based SSH.')
                 process_runner[target] = ProcessRunner(
                     lambda args, **kwargs:
-                    target.run_process_with_password_based_ssh(args, **kwargs),
+                    targets[-1].run_process_with_password_based_ssh(args, **kwargs),
                     hostname=target.hostname, login_name=target.login_name,
                     sudo_username=target.sudo_username)
                 continue
@@ -1868,7 +1878,7 @@ public-key-based SSH.")
 public-key-based SSH.", file=sys.stderr)
             sys.exit(1)
 
-        assert(isinstance(authorizee, UserOneServer))
+        assert(isinstance(authorizee, UserOnServer))
         if authorizee.check_public_key_based_ssh_to_target(target):
             _print_info(f"Confirmed that `{authorizee}' was authorized to log \
 in to `{target}' with public-key-based SSH.")
