@@ -727,7 +727,8 @@ returncode: {process.returncode}''')
         return True
 
     def _check_public_key_based_ssh_to_target_impl(
-            self, target: 'UserOnServer') -> subprocess.CompletedProcess:
+            self, target: 'UserOnServer', *, use_rsh: bool) \
+        -> subprocess.CompletedProcess:
         args = ['ssh', '-o', 'BatchMode = yes',
                 '-o', 'StrictHostKeyChecking = yes',
                 '-o', 'PreferredAuthentications = publickey', '-T']
@@ -744,11 +745,15 @@ returncode: {process.returncode}''')
 
         if target.sudo_username is None:
             args.append('whoami')
+            if use_rsh:
+                return self.run_process_with_rsh(args)
             return self.run_process_with_public_key_based_ssh(args)
 
         if target.sudo_password is None:
             args.extend(('sudo', '-nkHu', target.sudo_username, '--',
                          'whoami'))
+            if use_rsh:
+                return self.run_process_with_rsh(args)
             return self.run_process_with_public_key_based_ssh(args)
 
         target_process_runner = ProcessRunner(
@@ -762,11 +767,14 @@ returncode: {process.returncode}''')
             args.extend(('env', f'SUDO_ASKPASS={sudo_askpass_file.path}',
                          'sudo', '-nAkHu', target.sudo_username, '--',
                          'whoami'))
+            if use_rsh:
+                return self.run_process_with_rsh(args)
             return self.run_process_with_public_key_based_ssh(args)
 
-    def check_public_key_based_ssh_to_target(self,
-                                             target: 'UserOnServer') -> bool:
-        process = self._check_public_key_based_ssh_to_target_impl(target)
+    def check_public_key_based_ssh_to_target(
+            self, target: 'UserOnServer', *, use_rsh: bool = False) -> bool:
+        process = self._check_public_key_based_ssh_to_target_impl(
+            target, use_rsh=use_rsh)
         if process.returncode != 0:
             return False
         if target.sudo_username is None:
@@ -774,12 +782,7 @@ returncode: {process.returncode}''')
         else:
             expected_stdout = target.sudo_username
         if process.stdout.rstrip('\n') != expected_stdout:
-            raise RuntimeError(f'''An error occurred while checking \
-public-key-based `ssh' from `{self}' to `{target}'.
-args: {process.args}
-stdout: {process.stdout}
-stderr: {process.stderr}
-returncode: {process.returncode}''')
+            return False
         return True
 
 
@@ -1683,14 +1686,38 @@ def authorize(user_identity_preference: List[FineGrainedKeytype],
               target_hostname: str,
               authorizee_process_runner: ProcessRunner,
               target_process_runner: ProcessRunner) -> None:
+    _print_info(f"Getting the host public key of the target \
+`{target_process_runner}'.")
     host_public_keys = _get_host_public_keys(target_process_runner)
+    _print_info(f"Got the host public key of the target \
+`{target_process_runner}'.")
+
+    _print_info(f"Adding the host public key of the target \
+`{target_process_runner}' to the `known_hosts' file of the authorizee \
+`{authorizee_process_runner}'.")
     _add_host_public_key(authorizee_process_runner, target_hostname,
                          host_public_keys)
+    _print_info(f"Added the host public key of the target \
+`{target_process_runner}' to the `known_hosts' file of the authorizee \
+`{authorizee_process_runner}'.")
 
+    _print_info(f"Getting the user identity of the authorizee \
+`{authorizee_process_runner}'.")
     user_identities = _get_user_identities(authorizee_process_runner,
                                            target_hostname)
+    _print_info(f"Got the user identity of the authorizee \
+`{authorizee_process_runner}'.")
+
+    _print_info(f"Getting the public keys authorized by the target \
+`{target_process_runner}'.")
     authorized_keys = _get_authorized_keys(target_process_runner)
+    _print_info(f"Got the public keys authorized by the target \
+`{target_process_runner}'.")
+
     if len(user_identities & authorized_keys) > 0:
+        _print_info(f"A user identity of the authorizee \
+`{authorizee_process_runner}' is already authorized by the target \
+`{target_process_runner}'.")
         return
 
     preferred_user_identity = None
@@ -1755,17 +1782,16 @@ if __name__ == '__main__':
         if isinstance(authorizee, UserOnServer):
             process_runner[authorizee] = None
         process_runner[target] = None
-    targets = []
     for target in process_runner.keys():
         _print_info(f"Checking which method the current user \
 `{_get_current_username()}' can log in to `{target}'... ", end='')
 
-        targets.append(target)
         if target.check_public_key_based_ssh():
             _print_info('public-key-based SSH.')
             process_runner[target] = ProcessRunner(
-                lambda args, **kwargs:
-                targets[-1].run_process_with_public_key_based_ssh(args, **kwargs),
+                (lambda target: (
+                    lambda args, **kwargs:
+                    target.run_process_with_public_key_based_ssh(args, **kwargs)))(target),
                 hostname=target.hostname, login_name=target.login_name,
                 sudo_username=target.sudo_username)
             continue
@@ -1773,8 +1799,9 @@ if __name__ == '__main__':
         if options.use_rsh and target.check_rsh():
             _print_info('rsh')
             process_runner[target] = ProcessRunner(
-                lambda args, **kwargs:
-                targets[-1].run_process_with_rsh(args, **kwargs),
+                (lambda target: (
+                    lambda args, **kwargs:
+                    target.run_process_with_rsh(args, **kwargs)))(target),
                 hostname=target.hostname, login_name=target.login_name,
                 sudo_username=target.sudo_username)
             continue
@@ -1782,8 +1809,9 @@ if __name__ == '__main__':
         if target.check_password_based_ssh():
             _print_info('password-based SSH.')
             process_runner[target] = ProcessRunner(
-                lambda args, **kwargs:
-                targets[-1].run_process_with_password_based_ssh(args, **kwargs),
+                (lambda target: (
+                    lambda args, **kwargs:
+                    target.run_process_with_password_based_ssh(args, **kwargs)))(target),
                 hostname=target.hostname, login_name=target.login_name,
                 sudo_username=target.sudo_username)
             continue
@@ -1815,8 +1843,9 @@ file by executing `ssh-keygen -R {target.hostname}' would resolve this issue.")
             if target.check_public_key_based_ssh():
                 _print_info('public-key-based SSH.')
                 process_runner[target] = ProcessRunner(
-                    lambda args, **kwargs:
-                    targets[-1].run_process_with_public_key_based_ssh(args, **kwargs),
+                    (lambda target: (
+                        lambda args, **kwargs:
+                        target.run_process_with_public_key_based_ssh(args, **kwargs)))(target),
                     hostname=target.hostname, login_name=target.login_name,
                     sudo_username=target.sudo_username)
                 continue
@@ -1824,8 +1853,9 @@ file by executing `ssh-keygen -R {target.hostname}' would resolve this issue.")
             if target.check_password_based_ssh():
                 _print_info('password-based SSH.')
                 process_runner[target] = ProcessRunner(
-                    lambda args, **kwargs:
-                    targets[-1].run_process_with_password_based_ssh(args, **kwargs),
+                    (lambda target: (
+                        lambda args, **kwargs:
+                        target.run_process_with_password_based_ssh(args, **kwargs)))(target),
                     hostname=target.hostname, login_name=target.login_name,
                     sudo_username=target.sudo_username)
                 continue
@@ -1847,6 +1877,11 @@ Skipped.")
                 _print_info(f"`{authorizee}' is already althorized to log in \
 to `{target}' with public-key-based SSH. Skipped.")
                 continue
+            if options.use_rsh:
+                if authorizee.check_public_key_based_ssh_to_target(
+                        target, use_rsh=True):
+                    _print_info(f"`{authorizee}' is already althorized to log \
+in to `{target}' with public-key-based SSH. Skipped.")
 
         if authorizee is None:
             authorizee_process_runner = ProcessRunner(
@@ -1882,7 +1917,14 @@ public-key-based SSH.", file=sys.stderr)
         if authorizee.check_public_key_based_ssh_to_target(target):
             _print_info(f"Confirmed that `{authorizee}' was authorized to log \
 in to `{target}' with public-key-based SSH.")
-        else:
-            print(f"Failed to authorize `{authorizee}' to log in to \
-`{target}' with public-key-based SSH.", file=sys.stderr)
-            sys.exit(1)
+            continue
+        if options.use_rsh:
+            if authorizee.check_public_key_based_ssh_to_target(target,
+                                                               use_rsh=True):
+                _print_info(f"Confirmed that `{authorizee}' was authorized to \
+log in to `{target}' with public-key-based SSH.")
+                continue
+
+        print(f"Failed to authorize `{authorizee}' to log in to `{target}' \
+with public-key-based SSH.", file=sys.stderr)
+        sys.exit(1)
